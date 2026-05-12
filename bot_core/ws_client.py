@@ -15,7 +15,7 @@ from llm_client import ask_llm
 from map import get_weather
 
 from .auth_service import build_cookie_header
-from .config import AppConfig, ReconnectContext
+from .config import AppConfig, ReconnectContext, load_app_secrets, save_app_secrets
 from .friend_service import FriendHttpService, collect_friend_records
 from .logging_utils import (
     RoomSayLogger,
@@ -30,6 +30,7 @@ from .parsers import (
     now_str,
     parse_cmd_and_obj,
 )
+from .runtime import set_active_client
 
 
 @dataclass
@@ -92,6 +93,8 @@ class GameWebSocketClient:
         self.stop_keepalive = threading.Event()
         self.send_lock = threading.Lock()
         self.friend_http_lock = threading.Lock()
+        self._active_ws = None
+        self._active_ws_lock = threading.Lock()
 
         self.auth_candidates = self._build_auth_candidates()
 
@@ -141,6 +144,42 @@ class GameWebSocketClient:
         with self.send_lock:
             ws.send(text)
         print(f"ws_send[{tag}]={text}")
+
+    def _set_active_socket(self, ws) -> None:
+        with self._active_ws_lock:
+            self._active_ws = ws
+
+    def get_active_socket(self):
+        """获取当前活跃的 WebSocket 连接实例。"""
+        with self._active_ws_lock:
+            return self._active_ws
+
+    def send_raw(self, payload: Dict[str, object], tag: str = "admin") -> bool:
+        """通过当前活跃 socket 发送任意 JSON。"""
+        ws = self.get_active_socket()
+        if ws is None:
+            return False
+        try:
+            self._send_json(ws, payload, tag)
+            return True
+        except Exception as exc:
+            print(f"admin_send_error tag={tag} err={exc}")
+            return False
+
+    def send_room_message(self, message: str) -> bool:
+        """向房间发送一条普通消息。"""
+        text = str(message or "").strip()
+        if not text:
+            return False
+        return self.send_raw(
+            {
+                "Act": "",
+                "Color": "#FFFFFF",
+                "Msg": text,
+                "c": "SayInRoom",
+            },
+            "adminSayInRoom",
+        )
 
     def _should_suppress_ws_log(self, cmd: str) -> bool:
         if not self.config.filter_loudspeaker_logs:
@@ -578,6 +617,44 @@ class GameWebSocketClient:
         if not content:
             return
 
+        # 特殊指令处理：如果消息格式为 "<roomsite>[ ,]?添加权限[ ,]?<username>"，
+        # 则在执行调用大模型前把 <username> 添加到 app_secrets.json 的 room_say_llm_allowlist。
+        # 支持分隔符为空格或逗号或无分隔符。
+        cmd_marker = "添加权限"
+        idx = content.find(cmd_marker)
+        if idx != -1:
+            left = content[:idx].strip(" ,")
+            right = content[idx + len(cmd_marker) :].strip(" ,")
+            new_name = right or ""
+            # 如果没有提取到用户名，则不处理
+            if new_name:
+                # 仅当发送者在当前白名单内才允许操作
+                current_allowed = self.config.get_room_say_llm_allowlist()
+                if sender_name in current_allowed:
+                    # 读取当前 secrets，确保类型正确并更新
+                    current = load_app_secrets(force_reload=True)
+                    if not isinstance(current, dict):
+                        current = {}
+
+                    raw_list = current.get("room_say_llm_allowlist", [])
+                    if isinstance(raw_list, list):
+                        allowlist = [str(i).strip() for i in raw_list if str(i).strip()]
+                    elif isinstance(raw_list, str):
+                        allowlist = [p.strip() for p in raw_list.split(",") if p.strip()]
+                    else:
+                        allowlist = []
+
+                    if new_name not in allowlist:
+                        allowlist.append(new_name)
+                        current["room_say_llm_allowlist"] = allowlist
+                        ok = save_app_secrets(current)
+                        print(f"permission_cmd_by={sender_name} target={new_name} saved={ok}")
+                    else:
+                        print(f"permission_already_exists target={new_name}")
+                    # 不继续调用大模型
+                    return
+
+
         # 为避免模型直接复述问题，构造更明确的提示：
         # 说明提问者并要求模型直接回答且不要复述问题。
         if sender_name:
@@ -806,6 +883,7 @@ class GameWebSocketClient:
         self._send_json(ws, payload, "acceptInviteLeaveRoom")
 
     def _on_open(self, ws) -> None:
+        self._set_active_socket(ws)
         print("ws_connected=1")
         self._send_flow(ws)
 
@@ -905,6 +983,7 @@ class GameWebSocketClient:
 
     def _on_close(self, _ws, status_code, close_msg) -> None:
         self.stop_keepalive.set()
+        self._set_active_socket(None)
         print(f"ws_closed code={status_code} msg={close_msg}")
         if self.state.retried_on_notreg and not self.state.success:
             print("提示: 已尝试多组认证参数，仍然 NotReg，可继续抓包首包进一步确定登录字段")
@@ -914,36 +993,40 @@ class GameWebSocketClient:
         if not cookie_header:
             raise RuntimeError("未获取到 Cookie，无法建立游戏 WebSocket 会话")
 
-        ws_url = self._bootstrap_ws_url()
-        self.reconnect.next_ws_url = ""
-        self.state.connected_ws_line_id = self._extract_line_id_from_ws_url(ws_url) or self.reconnect.next_line_id
-        self.reconnect.next_line_id = ""
-        print(f"ws_target={ws_url}")
-
-        headers = [
-            "Origin: https://t1.ss911.cn",
-            "Pragma: no-cache",
-            "Cache-Control: no-cache",
-            "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8",
-            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0",
-            f"Cookie: {cookie_header}",
-        ]
-
-        ws_app = websocket.WebSocketApp(
-            ws_url,
-            header=headers,
-            on_open=self._on_open,
-            on_message=self._on_message,
-            on_error=self._on_error,
-            on_close=self._on_close,
-        )
+        set_active_client(self)
         try:
-            ws_app.run_forever(ping_interval=20, ping_timeout=10)
-        except Exception as exc:
-            print(f"ws_run_forever_error={exc}")
-            traceback.print_exc()
-            raise
+            ws_url = self._bootstrap_ws_url()
+            self.reconnect.next_ws_url = ""
+            self.state.connected_ws_line_id = self._extract_line_id_from_ws_url(ws_url) or self.reconnect.next_line_id
+            self.reconnect.next_line_id = ""
+            print(f"ws_target={ws_url}")
+
+            headers = [
+                "Origin: https://t1.ss911.cn",
+                "Pragma: no-cache",
+                "Cache-Control: no-cache",
+                "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8",
+                "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0",
+                f"Cookie: {cookie_header}",
+            ]
+
+            ws_app = websocket.WebSocketApp(
+                ws_url,
+                header=headers,
+                on_open=self._on_open,
+                on_message=self._on_message,
+                on_error=self._on_error,
+                on_close=self._on_close,
+            )
+            try:
+                ws_app.run_forever(ping_interval=20, ping_timeout=10)
+            except Exception as exc:
+                print(f"ws_run_forever_error={exc}")
+                traceback.print_exc()
+                raise
+        finally:
+            set_active_client(None)
 
     def _parse_weather_query(self, msg_text: str) -> tuple:
         """

@@ -4,6 +4,7 @@ import requests
 
 from .auth_service import AuthService
 from .config import AppConfig, ReconnectContext
+from .runtime import get_active_client, get_active_socket, register_runner, unregister_runner, send_room_message
 from .ws_client import GameWebSocketClient
 
 
@@ -20,6 +21,7 @@ class ApplicationRunner:
         self.config = config or AppConfig()
         self.reconnect = ReconnectContext()
         self.auth_service = AuthService(self.config)
+        register_runner(self)
 
     def _acquire_fv(self, session: requests.Session) -> dict:
         """根据当前模式决定是否复用缓存 token。"""
@@ -64,3 +66,19 @@ class ApplicationRunner:
                 self.reconnect.jump_reconnect_count = 0
 
             time.sleep(wait_seconds)
+
+    def get_active_client(self):
+        """获取当前活跃的 WebSocket 客户端。"""
+        return get_active_client()
+
+    def get_active_socket(self):
+        """获取当前活跃的 WebSocket 连接实例。"""
+        return get_active_socket()
+
+    def send_room_message(self, message: str) -> bool:
+        """通过当前活跃连接发送房间消息。"""
+        return send_room_message(message)
+
+    def close(self) -> None:
+        """取消注册当前运行器。"""
+        unregister_runner(self)

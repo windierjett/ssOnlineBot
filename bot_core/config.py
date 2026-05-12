@@ -56,6 +56,25 @@ def load_app_secrets(force_reload: bool = False) -> Dict[str, Any]:
     return _secrets_cache
 
 
+def save_app_secrets(data: Dict[str, Any]) -> bool:
+    """将敏感配置写回到 app_secrets.json 并刷新缓存。
+
+    返回 True 表示写入成功，False 表示失败。
+    """
+    global _secrets_cache, _secrets_mtime_ns
+    try:
+        _SECRETS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        # force reload to update in-memory cache and mtime
+        _secrets_cache = data
+        try:
+            _secrets_mtime_ns = _SECRETS_FILE.stat().st_mtime_ns
+        except OSError:
+            _secrets_mtime_ns = None
+        return True
+    except Exception:
+        return False
+
+
 def get_secret(name: str, default: str = "") -> str:
     """读取指定敏感配置项，缺失时返回默认值。"""
     value = load_app_secrets().get(name, default)
