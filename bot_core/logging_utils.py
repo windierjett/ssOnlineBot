@@ -12,6 +12,99 @@ def append_log_line(file_path: str, line: str) -> None:
         f.write(line + "\n")
 
 
+def _extract_message_body(line: str) -> str:
+    """从日志行中提取消息正文。"""
+    text = str(line or "").strip()
+    if not text:
+        return ""
+
+    parts = text.rsplit(":", 1)
+    if len(parts) == 2:
+        return parts[1].strip()
+
+    return text
+
+
+def _normalize_message(text: str) -> str:
+    """用于重复与垃圾检测的归一化文本。"""
+    value = str(text or "").strip().lower()
+    if not value:
+        return ""
+
+    value = re.sub(r"\s+", "", value)
+    value = re.sub(r"[\W_]+", "", value, flags=re.UNICODE)
+    return value
+
+
+def _is_garbled_or_spam(text: str) -> bool:
+    """判断是否为乱码、刷屏或无意义输入。"""
+    value = str(text or "").strip()
+    if not value:
+        return True
+
+    if value.isdigit():
+        return True
+
+    normalized = _normalize_message(value)
+    if not normalized:
+        return True
+
+    # 仅由少量重复字符组成的刷屏文本，例如 "哈哈哈哈哈"、"11111"、"。。。。。"
+    if len(set(normalized)) <= 2 and len(normalized) >= 5:
+        return True
+
+    # 明显乱码：大部分字符不可读或无字母/数字/中文
+    readable = re.findall(r"[A-Za-z0-9\u4e00-\u9fff]", value)
+    if not readable:
+        return True
+
+    # 过短且缺少有效字符的噪声，通常没有存储价值
+    if len(normalized) <= 1:
+        return True
+
+    return False
+
+
+def _contains_abusive_language(text: str) -> bool:
+    """判断是否包含常见辱骂或垃圾话。"""
+    value = str(text or "").lower()
+    if not value:
+        return False
+
+    blocked_terms = (
+        "傻逼",
+        "sb",
+        "垃圾",
+        "滚",
+        "去死",
+        "废物",
+        "脑残",
+        "傻叉",
+        "狗东西",
+    )
+    return any(term in value for term in blocked_terms)
+
+
+def _should_store_room_say_message(msg_text: str, previous_msg_text: str = "") -> bool:
+    """判断是否应写入房间聊天日志。"""
+    current = str(msg_text or "").strip()
+    if not current:
+        return False
+
+    if _is_garbled_or_spam(current):
+        return False
+
+    if _contains_abusive_language(current):
+        return False
+
+    current_norm = _normalize_message(current)
+    previous_norm = _normalize_message(previous_msg_text)
+    if current_norm and previous_norm and current_norm == previous_norm:
+        return False
+
+    return True
+
+
 def sanitize_filename(name: str) -> str:
     """将昵称转换成安全文件名。"""
     cleaned = re.sub(r'[\\/:*?"<>|]+', "_", str(name or "").strip())
@@ -49,6 +142,22 @@ class RoomSayLogger:
         file_name = mapped if mapped else f"room_say_{sanitize_filename(sender_name)}.txt"
         return os.path.join(self.config.room_say_log_dir, file_name)
 
+    def _get_last_room_say_message(self) -> str:
+        """读取主日志的最后一条消息正文，用于重复过滤。"""
+        log_file = self.config.room_say_log_file
+        try:
+            with open(log_file, "r", encoding="utf-8") as file_handle:
+                last_line = ""
+                for line in file_handle:
+                    stripped = line.rstrip("\r\n")
+                    if stripped:
+                        last_line = stripped
+                return _extract_message_body(last_line)
+        except FileNotFoundError:
+            return ""
+        except OSError:
+            return ""
+
     def log_room_say_message(self, obj: dict, room_id: str = "") -> None:
         if not self.config.room_say_log_enabled:
             return
@@ -59,6 +168,10 @@ class RoomSayLogger:
 
         os.makedirs(self.config.room_say_log_dir, exist_ok=True)
         log_file = self._get_room_say_log_file(sender_name)
+
+        previous_message = self._get_last_room_say_message()
+        if not _should_store_room_say_message(msg_text, previous_message):
+            return
 
         if room_id:
             full_line = f"[{now_str()}] [{room_id}] {sender_name}: {msg_text}"

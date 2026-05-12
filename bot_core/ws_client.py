@@ -2,6 +2,7 @@ import json
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 from urllib.parse import unquote
@@ -11,7 +12,7 @@ import traceback
 
 import requests
 import websocket
-from llm_client import ask_llm
+from llm_client import ask_llm_chunks
 from map import get_weather
 
 from .auth_service import build_cookie_header
@@ -61,6 +62,7 @@ class WsState:
     bootstrap_room_pwd: str = ""
     rejoin_watch_version: int = 0
     connected_ws_line_id: str = ""
+    llm_recent_chat_sent_at: float = 0.0
 
 
 class GameWebSocketClient:
@@ -586,6 +588,59 @@ class GameWebSocketClient:
             self._send_json(ws, {"cmd": "JoinHall"}, "JoinHall")
             self.state.join_hall_sent = True
 
+    @staticmethod
+    def _extract_sender_from_room_log_line(line: str) -> str:
+        """从 room_say 日志行中提取发送者昵称。"""
+        text = str(line or "").strip()
+        if not text:
+            return ""
+        match = re.match(r"^\[[^\]]+\]\s*(?:\[[^\]]+\]\s*)?([^:]+):\s*.*$", text)
+        if not match:
+            return ""
+        return str(match.group(1) or "").strip()
+
+    def _get_recent_room_messages_for_llm(self, limit: int = 30, exclude_sender: str = "夏凌依") -> list[str]:
+        """读取 room_say.txt 最近若干条，按发送者过滤。"""
+        file_path = self.config.room_say_log_file
+        if not file_path or not os.path.exists(file_path):
+            return []
+
+        kept: list[str] = []
+        try:
+            with open(file_path, "r", encoding="utf-8") as file_handle:
+                for raw_line in file_handle:
+                    line = raw_line.rstrip("\r\n")
+                    if not line:
+                        continue
+                    sender = self._extract_sender_from_room_log_line(line)
+                    if sender == exclude_sender:
+                        continue
+                    kept.append(line)
+        except OSError:
+            return []
+
+        if limit <= 0:
+            return []
+        return kept[-limit:]
+
+    def _build_recent_chat_context_for_llm(self) -> str:
+        """每 5 分钟最多追加一次最近 30 条聊天上下文。"""
+        now = time.time()
+        if now - float(self.state.llm_recent_chat_sent_at or 0.0) < 300:
+            return ""
+
+        recent_lines = self._get_recent_room_messages_for_llm(limit=30, exclude_sender="夏凌依")
+        if not recent_lines:
+            return ""
+
+        self.state.llm_recent_chat_sent_at = now
+        context_body = "\n".join(recent_lines)
+        return (
+            "以下是 room_say 最近30条聊天记录（已过滤发送者“夏凌依”），仅供你理解上下文：\n"
+            f"{context_body}\n"
+            "请基于这些上下文回答当前问题，回答仍需简短。"
+        )
+
     def _dispatch_room_say_to_llm(self, ws, obj: dict) -> None:
         """将 RoomSay 文本异步转发给大模型，并把结果按 SayInRoom 格式发送。"""
         sender_name, msg_text = parse_room_say_payload(obj)
@@ -657,33 +712,40 @@ class GameWebSocketClient:
 
         # 为避免模型直接复述问题，构造更明确的提示：
         # 说明提问者并要求模型直接回答且不要复述问题。
+        recent_context = self._build_recent_chat_context_for_llm()
         if sender_name:
-            llm_input = (
-                f"玩家 {sender_name} 提问：{content}\n请作为友好的玩家直接回答这个问题，" 
+            base_input = (
+                f"玩家 {sender_name} 提问：{content}\n请作为友好的玩家直接回答这个问题，"
                 "不要复述问题，回答简短。"
             )
         else:
-            llm_input = f"请直接回答：{content}，不要复述问题。"
+            base_input = f"请直接回答：{content}，不要复述问题。"
+
+        llm_input = f"{recent_context}\n\n{base_input}" if recent_context else base_input
 
         def worker() -> None:
             try:
-                llm_reply = ask_llm(llm_input)
-                reply_text = str(llm_reply or "").strip()
-                if not reply_text:
+                reply_chunks = ask_llm_chunks(llm_input, chunk_size=50)
+                if not reply_chunks:
                     print("llm_reply_empty=1")
                     return
 
-                self._send_json(
-                    ws,
-                    {
-                        "Act": "",
-                        "Color": "#FFFFFF",
-                        "Msg": reply_text,
-                        "c": "SayInRoom",
-                    },
-                    "llmSayInRoom",
-                )
-                print(f"llm_reply={reply_text}")
+                for idx, chunk in enumerate(reply_chunks, start=1):
+                    reply_text = str(chunk or "").strip()
+                    if not reply_text:
+                        continue
+
+                    self._send_json(
+                        ws,
+                        {
+                            "Act": "",
+                            "Color": "#FFFFFF",
+                            "Msg": reply_text,
+                            "c": "SayInRoom",
+                        },
+                        f"llmSayInRoom#{idx}",
+                    )
+                print(f"llm_reply_chunks={len(reply_chunks)}")
             except Exception as exc:
                 print(f"llm_call_error={exc}")
 

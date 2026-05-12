@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .app_runner import ApplicationRunner
 from .config import load_app_secrets
+from .logging_utils import sanitize_filename
 
 
 _SECRETS_FILE = Path(__file__).resolve().parent.parent / "app_secrets.json"
@@ -121,6 +122,74 @@ class _AdminHttpHandler(BaseHTTPRequestHandler):
         snapshot["recent_message_count"] = len(messages)
         self._send_json(200, {"ok": True, "data": snapshot})
 
+    def _handle_friends(self) -> None:
+        result = self.server.app.get_friends()
+        if not result.get("ok"):
+            self._send_json(503, result)
+            return
+        self._send_json(200, result)
+
+    def _handle_friend_status_history(self) -> None:
+        raw_limit = self._extract_param("limit")
+        limit = 5000
+        if raw_limit:
+            try:
+                limit = max(0, min(int(raw_limit), 5000))
+            except ValueError:
+                limit = 5000
+
+        log_file = self.server.app.runner.config.friend_monitor_log_file
+        messages = self._tail_lines(str(log_file), limit=limit)
+        self._send_json(200, {"ok": True, "friend_status_history": messages, "data": messages})
+
+    def _handle_room_message_history(self) -> None:
+        raw_limit = self._extract_param("limit")
+        limit = 5000
+        if raw_limit:
+            try:
+                limit = max(0, min(int(raw_limit), 5000))
+            except ValueError:
+                limit = 5000
+
+        log_file = self.server.app.runner.config.room_say_log_file
+        messages = self._tail_lines(str(log_file), limit=limit)
+        self._send_json(200, {"ok": True, "room_message_history": messages, "count": len(messages), "data": messages})
+
+    def _handle_all_friend_messages(self) -> None:
+        log_dir = Path(self.server.app.runner.config.room_say_log_dir)
+        friends: list[str] = []
+        if log_dir.is_dir():
+            for log_file in sorted(log_dir.glob("room_say_*.txt")):
+                if log_file.name == "room_say.txt":
+                    continue
+                friend_name = log_file.stem.removeprefix("room_say_")
+                friends.append(friend_name)
+        self._send_json(200, {"ok": True, "friends": friends, "data": friends})
+
+    def _handle_friend_messages(self) -> None:
+        friend_name = str(self._extract_param("friendName") or "").strip()
+        if not friend_name:
+            self._send_json(400, {"ok": False, "error": "friendName 不能为空"})
+            return
+
+        config = self.server.app.runner.config
+        file_name = config.room_say_name_to_file.get(friend_name)
+        if not file_name:
+            file_name = f"room_say_{sanitize_filename(friend_name)}.txt"
+
+        log_file = Path(config.room_say_log_dir) / file_name
+        messages = self._tail_lines(str(log_file), limit=5000)
+        self._send_json(
+            200,
+            {
+                "ok": True,
+                "friendName": friend_name,
+                "friend_messages": messages,
+                "count": len(messages),
+                "data": messages,
+            },
+        )
+
     def _handle_permission(self) -> None:
         name = self._extract_param("name")
         enabled_raw = self._extract_param("enabled") or self._extract_param("boolean")
@@ -168,6 +237,26 @@ class _AdminHttpHandler(BaseHTTPRequestHandler):
             self._handle_room_messages()
             return
 
+        if route == "/api/friends":
+            self._handle_friends()
+            return
+
+        if route == "/api/friend-status-history":
+            self._handle_friend_status_history()
+            return
+
+        if route == "/api/room-message-history":
+            self._handle_room_message_history()
+            return
+
+        if route == "/api/all-friend-messages":
+            self._handle_all_friend_messages()
+            return
+
+        if route == "/api/friend-messages":
+            self._handle_friend_messages()
+            return
+
         if route == "/api/room-permission":
             self._handle_permission()
             return
@@ -188,6 +277,26 @@ class _AdminHttpHandler(BaseHTTPRequestHandler):
             self._handle_room_messages()
             return
 
+        if route == "/api/friends":
+            self._handle_friends()
+            return
+
+        if route == "/api/friend-status-history":
+            self._handle_friend_status_history()
+            return
+
+        if route == "/api/room-message-history":
+            self._handle_room_message_history()
+            return
+
+        if route == "/api/all-friend-messages":
+            self._handle_all_friend_messages()
+            return
+
+        if route == "/api/friend-messages":
+            self._handle_friend_messages()
+            return
+
         if route == "/api/room-permission":
             self._handle_permission()
             return
@@ -203,6 +312,11 @@ class _AdminHttpHandler(BaseHTTPRequestHandler):
         if route in {
             "/api/roomsay",
             "/api/room-messages",
+            "/api/friends",
+            "/api/friend-status-history",
+            "/api/room-message-history",
+            "/api/all-friend-messages",
+            "/api/friend-messages",
             "/api/room-permission",
             "/api/room-permission-list",
         }:
@@ -224,6 +338,21 @@ class AdminApiRunner:
     def send_room_message(self, msg: str) -> bool:
         """通过当前活跃连接发送 RoomSay。"""
         return self.runner.send_room_message(msg)
+
+    def get_friends(self) -> dict[str, Any]:
+        """调用项目中已有的好友列表接口，返回当前好友数据。"""
+        client = self.runner.get_active_client()
+        if client is None:
+            return {"ok": False, "error": "当前无可用连接，无法获取好友列表"}
+
+        try:
+            data = client.friend_http_service.fetch_friends_via_http(
+                client.session,
+                client.fv.get("u", ""),
+            )
+            return {"ok": True, "data": data}
+        except Exception as exc:
+            return {"ok": False, "error": f"获取好友列表失败: {exc}"}
 
     def get_room_snapshot(self) -> dict[str, Any]:
         """返回当前活跃连接和房间状态快照。"""
