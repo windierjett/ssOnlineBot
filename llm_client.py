@@ -139,11 +139,72 @@ def _is_story_request(text: str) -> bool:
 
 
 def _split_text_by_chars(text: str, chunk_size: int = SEND_CHUNK_CHARS) -> list[str]:
+    """智能分割文本，优先在标点符号处断句。
+
+
+    Args:
+        text: 要分割的文本
+        chunk_size: 每个片段的目标字符数
+
+    Returns:
+        分割后的文本片段列表
+    """
     raw = str(text or "").strip()
     if not raw:
         return []
-    size = max(int(chunk_size), 1)
-    return [raw[i : i + size] for i in range(0, len(raw), size)]
+
+    # 定义可以断句的标点符号（优先级从高到低）
+    strong_breaks = {'。', '！', '？', '…', '\n'}  # 强断点：句号、感叹号、问号等
+    medium_breaks = {'，', '；', '、', ')', '）', '"', '"'}  # 中断点：逗号、分号等
+    weak_breaks = {' ', '—', '-', '(', '（'}  # 弱断点：空格、破折号等
+
+    chunks = []
+    start = 0
+    text_len = len(raw)
+
+    while start < text_len:
+        # 计算当前片段的结束位置
+        end = min(start + chunk_size, text_len)
+
+        # 如果已经到达文本末尾，直接截取
+        if end >= text_len:
+            chunks.append(raw[start:])
+            break
+
+        # 在 [start, end] 范围内寻找最佳断点
+        best_end = end
+        best_priority = -1  # 3=强断点, 2=中断点, 1=弱断点, 0=无断点
+
+        # 从后往前搜索，优先找靠近 chunk_size 的断点
+        search_start = max(start, end - chunk_size // 2)  # 至少保留一半长度
+
+        for i in range(end, search_start - 1, -1):
+            char = raw[i]
+
+            if char in strong_breaks:
+                best_end = i + 1  # 包含标点符号
+                best_priority = 3
+                break
+            elif char in medium_breaks and best_priority < 2:
+                best_end = i + 1
+                best_priority = 2
+            elif char in weak_breaks and best_priority < 1:
+                best_end = i + 1
+                best_priority = 1
+
+        # 如果没找到合适的断点，就强制在 chunk_size 处切割
+        if best_priority == -1:
+            best_end = end
+
+        # 提取片段并去除首尾空白
+        chunk = raw[start:best_end].strip()
+        if chunk:
+            chunks.append(chunk)
+
+        start = best_end
+
+    return chunks
+
 
 # --- LangChain 组件初始化 ---
 # 1. 定义 Prompt 模板
@@ -159,13 +220,7 @@ prompt = ChatPromptTemplate.from_messages([
 ])
 
 prompt_long = ChatPromptTemplate.from_messages([
-    ("system", """你是一个有独立见解的聊天伙伴，性格自然不机械。请遵守以下原则：
-1. 【保持独立】不盲目附和或迎合任何人，遇到主观评价请给出自己的客观看法。
-2. 【逻辑判断】如果前后说法矛盾，请指出差异并给出中立或温和的结论，不要简单重复对方的话。
-3. 【玩家口吻】回复像真实玩家一样自然，避免说教、AI腔或过度礼貌。
-4. 【信息不足】遇到模糊话题可委婉表达不确定，或分享自己的视角，不强行站队。
-5. 当前用户在请求故事类内容，你可以给出较完整回复。"""),
-    MessagesPlaceholder(variable_name="history"),
+    ("system", """发挥你的想象力，讲一个生动有趣且不重复的故事吧！"""),
     ("human", "{input}"),
 ])
 # 2. 定义 LLM 模型
@@ -182,16 +237,18 @@ llm_long = ChatOpenAI(
     model=DASHSCOPE_MODEL,
     base_url=DASHSCOPE_BASE_URL,
     api_key=DASHSCOPE_API_KEY,
-    temperature=0.8,
-    top_p=0.9,
+    temperature=0.98,
+    top_p=0.95,
     max_tokens=LONG_REPLY_MAX_TOKENS,
+    presence_penalty=1.2,  # 抑制重复剧情
+    frequency_penalty=0.95,  # 抑制重复词句
 )
 
 # 3. 定义 Memory（对话历史）
 memory = ConversationBufferMemory(
     memory_key="history",
     return_messages=True,
-    max_token_limit=3000  # 限制历史记录的总 token 数，超出自动遗忘
+    max_token_limit=10000  # 限制历史记录的总 token 数，超出自动遗忘
 )
 # --- 业务逻辑封装 ---
 _lock = threading.Lock()
@@ -206,7 +263,9 @@ def ask_llm(message: str) -> str:
     if not text:
         raise ValueError("message 不能为空")
 
-    if text == "终止对话":
+    # 检查是否为终止对话指令（支持多种表达）
+    stop_commands = ["终止对话", "清空历史", "重置对话", "清除记忆"]
+    if any(cmd in text for cmd in stop_commands):
         clear_conversation_history()
         return "已终止对话，历史消息已清空。"
 
@@ -222,28 +281,13 @@ def ask_llm(message: str) -> str:
         _last_request_time = now
 
     try:
-        story_mode = _is_story_request(text)
-        # 构建 Chain
-        # 使用 RunnablePassthrough 将 history 注入到 Prompt 中
-        if story_mode:
-            chain = (
-                {
-                    "input": RunnablePassthrough(),
-                    "history": lambda _: memory.load_memory_variables({})["history"],
-                }
-                | prompt_long
-                | llm_long
-            )
-        else:
-            chain = (
-                {
-                    "input": RunnablePassthrough(),
-                    "history": lambda _: memory.load_memory_variables({})["history"],
-                    "max_chars": lambda _: MAX_REPLY_CHARS
-                }
-                | prompt
-                | llm
-            )
+        # 短回复模式：日常聊天
+        chain_input = {
+            "input": RunnablePassthrough(),
+            "history": lambda _: memory.load_memory_variables({})["history"],
+            "max_chars": lambda _: MAX_REPLY_CHARS
+        }
+        chain = chain_input | prompt | llm
 
         # 调用并获取结果
         response = chain.invoke(text)
@@ -253,7 +297,7 @@ def ask_llm(message: str) -> str:
         memory.save_context({"input": text}, {"output": reply})
 
         # 非故事模式下安全截断（防止模型忽略指令）
-        if (not story_mode) and len(reply) > MAX_REPLY_CHARS:
+        if len(reply) > MAX_REPLY_CHARS:
             reply = reply[:MAX_REPLY_CHARS]
 
         return reply
@@ -274,15 +318,88 @@ def ask_llm_chunks(message: str, chunk_size: int = SEND_CHUNK_CHARS) -> list[str
     return _split_text_by_chars(reply, chunk_size=chunk_size)
 
 
+def ask_llm_stream(message: str, chunk_size: int = SEND_CHUNK_CHARS):
+    """流式调用 LLM，生成一个 chunk 就 yield 一个。
+
+    Args:
+        message: 用户输入
+        chunk_size: 每个片段的字符数
+
+    Yields:
+        str: 每次生成足够字符后返回一个片段
+    """
+    text = str(message or "").strip()
+    if not text:
+        raise ValueError("message 不能为空")
+
+    if text == "终止对话":
+        clear_conversation_history()
+        yield "已终止对话，历史消息已清空。"
+        return
+
+    # 限流逻辑
+    global _last_request_time, _inflight
+    now = time.time()
+    with _lock:
+        if now - _last_request_time < RATE_LIMIT_SECONDS:
+            return  # 丢弃频繁请求
+        if _inflight:
+            return  # 丢弃并发请求
+        _inflight = True
+        _last_request_time = now
+
+    try:
+        story_mode = _is_story_request(text)
+
+        # 选择对应的 LLM
+        selected_llm = llm_long if story_mode else llm
+
+        # 构建 Chain（故事模式不使用历史记忆）
+        # 故事模式：直接使用 prompt_long，不注入 history
+        chain_input = {
+            "input": RunnablePassthrough(),
+            "history": lambda _: memory.load_memory_variables({})["history"],
+        }
+        chain = chain_input | prompt_long | selected_llm
+        stream_input = {"input": text}
+        # 流式调用 LLM
+        buffer = ""
+        full_reply = ""
+
+        for chunk in chain.stream(stream_input):
+            # chunk.content 是每次生成的文本片段
+            if hasattr(chunk, 'content') and chunk.content:
+                token = chunk.content
+                full_reply += token
+                buffer += token
+
+                # 当缓冲区达到 chunk_size 时，yield 出去
+                if len(buffer) >= chunk_size:
+                    time.sleep(0.5)
+                    yield buffer[:chunk_size]
+                    buffer = buffer[chunk_size:]
+
+        # 发送剩余的缓冲区内容
+        if buffer:
+            yield buffer
+
+        # 更新 Memory（流式完成后）
+        if full_reply:
+            memory.save_context({"input": text}, {"output": full_reply})
+
+            # 非故事模式下安全截断
+            if (not story_mode) and len(full_reply) > MAX_REPLY_CHARS:
+                full_reply = full_reply[:MAX_REPLY_CHARS]
+
+    except Exception as e:
+        print(f"LLM stream error: {e}")
+    finally:
+        with _lock:
+            _inflight = False
+
 if __name__ == "__main__":
-    print(ask_llm("今天天气怎么样？"))
-    time.sleep(4)
-    print(ask_llm("我刚刚问了你什么？"))
-    time.sleep(4)
-    print(ask_llm("1+1="))
-    time.sleep(4)
-    print(ask_llm("2+2="))
-    time.sleep(4)
-    print(ask_llm("3+3="))
-    time.sleep(4)
-    print(ask_llm("按照规律，下一个问题是？"))
+    print("=== 测试流式输出 ===")
+    for chunk in ask_llm_stream("请你讲个故事？", chunk_size=50):
+        print(f"[Chunk] {chunk}")
+        print("-" * 40)
+        time.sleep(0.5)  # 模拟发送延迟

@@ -112,10 +112,10 @@ def sanitize_filename(name: str) -> str:
     return cleaned or "unknown"
 
 
-def parse_room_say_payload(obj: dict) -> Tuple[str, str]:
+def parse_room_say_payload(obj: dict) -> Tuple[str, str,str]:
     """提取 RoomSay 的发言昵称和内容。"""
     if not isinstance(obj, dict):
-        return "", ""
+        return "", "",""
 
     user_arr = obj.get("u")
     sender_name = ""
@@ -123,7 +123,9 @@ def parse_room_say_payload(obj: dict) -> Tuple[str, str]:
         sender_name = str(user_arr[2] or "")
 
     msg_text = str(obj.get("m", "") or "")
-    return sender_name, msg_text
+    position = str(obj.get("s", "") or "")
+    return sender_name, msg_text, position
+
 
 
 class RoomSayLogger:
@@ -162,7 +164,7 @@ class RoomSayLogger:
         if not self.config.room_say_log_enabled:
             return
 
-        sender_name, msg_text = parse_room_say_payload(obj)
+        sender_name, msg_text,position = parse_room_say_payload(obj)
         if not sender_name:
             return
 
@@ -173,10 +175,17 @@ class RoomSayLogger:
         if not _should_store_room_say_message(msg_text, previous_message):
             return
 
+        # 构建日志行，包含位置信息
         if room_id:
-            full_line = f"[{now_str()}] [{room_id}] {sender_name}: {msg_text}"
+            if position:
+                full_line = f"[{now_str()}] [{room_id}] [位置:{position}] {sender_name}: {msg_text}"
+            else:
+                full_line = f"[{now_str()}] [{room_id}] {sender_name}: {msg_text}"
         else:
-            full_line = f"[{now_str()}] {sender_name}: {msg_text}"
+            if position:
+                full_line = f"[{now_str()}] [位置:{position}] {sender_name}: {msg_text}"
+            else:
+                full_line = f"[{now_str()}] {sender_name}: {msg_text}"
 
         append_log_line(log_file, full_line)
         append_log_line(self.config.room_say_log_file, full_line)

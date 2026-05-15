@@ -127,7 +127,20 @@ class _AdminHttpHandler(BaseHTTPRequestHandler):
         if not result.get("ok"):
             self._send_json(503, result)
             return
-        self._send_json(200, result)
+        raw_data = result.get("data",{})
+        data_list = raw_data.get("data",[])
+        friends_clean = []
+        if data_list and len(data_list)>0:
+            headers = data_list[0]
+            for row in data_list[1:]:
+                item = dict(zip(headers,row))
+                friends_clean.append({
+                    "mood": item.get("mood",""),
+                    "userName": item.get("userName",""),
+                    "online": item.get("online",0)
+                })
+
+        self._send_json(200, {"ok":True, "friends": friends_clean})
 
     def _handle_friend_status_history(self) -> None:
         raw_limit = self._extract_param("limit")
@@ -139,7 +152,7 @@ class _AdminHttpHandler(BaseHTTPRequestHandler):
                 limit = 5000
 
         log_file = self.server.app.runner.config.friend_monitor_log_file
-        messages = self._tail_lines(str(log_file), limit=limit)
+        messages = self._tail_lines(str(log_file), limit=limit)[::-1]
         self._send_json(200, {"ok": True, "friend_status_history": messages, "data": messages})
 
     def _handle_room_message_history(self) -> None:
@@ -152,7 +165,7 @@ class _AdminHttpHandler(BaseHTTPRequestHandler):
                 limit = 5000
 
         log_file = self.server.app.runner.config.room_say_log_file
-        messages = self._tail_lines(str(log_file), limit=limit)
+        messages = self._tail_lines(str(log_file), limit=limit)[::-1]
         self._send_json(200, {"ok": True, "room_message_history": messages, "count": len(messages), "data": messages})
 
     def _handle_all_friend_messages(self) -> None:
@@ -178,7 +191,7 @@ class _AdminHttpHandler(BaseHTTPRequestHandler):
             file_name = f"room_say_{sanitize_filename(friend_name)}.txt"
 
         log_file = Path(config.room_say_log_dir) / file_name
-        messages = self._tail_lines(str(log_file), limit=5000)
+        messages = self._tail_lines(str(log_file), limit=5000)[::-1]
         self._send_json(
             200,
             {

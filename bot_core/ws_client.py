@@ -64,6 +64,13 @@ class WsState:
     connected_ws_line_id: str = ""
     llm_recent_chat_sent_at: float = 0.0
 
+    # 新增：维护用户名到位置的映射 {username: position}
+    user_position_map: Dict[str, str] = field(default_factory=dict)
+    last_position_update_time: float = 0.0
+    # 位置映射表的版本号，每次更新时递增
+    position_map_version: int = 0
+    # LLM 上次使用的位置映射表版本号
+    llm_last_position_map_version: int = 0
 
 class GameWebSocketClient:
     """WebSocket 客户端。
@@ -594,12 +601,17 @@ class GameWebSocketClient:
         text = str(line or "").strip()
         if not text:
             return ""
-        match = re.match(r"^\[[^\]]+\]\s*(?:\[[^\]]+\]\s*)?([^:]+):\s*.*$", text)
+        # 匹配包含位置信息的格式：[时间] [房间ID] [位置:X] 昵称: 消息
+        match = re.match(r"^\[[^\]]+\]\s*(?:\[[^\]]+\]\s*)?(?:\[位置:[^\]]+\]\s*)?([^:]+):\s*.*$", text)
         if not match:
-            return ""
+            # 回退到旧格式：[时间] [房间ID] 昵称: 消息
+            match = re.match(r"^\[[^\]]+\]\s*(?:\[[^\]]+\]\s*)?([^:]+):\s*.*$", text)
+            if not match:
+                return ""
+
         return str(match.group(1) or "").strip()
 
-    def _get_recent_room_messages_for_llm(self, limit: int = 30, exclude_sender: str = "夏凌依") -> list[str]:
+    def _get_recent_room_messages_for_llm(self, limit: int = 20, exclude_sender: str = "夏凌依") -> list[str]:
         """读取 room_say.txt 最近若干条，按发送者过滤。"""
         file_path = self.config.room_say_log_file
         if not file_path or not os.path.exists(file_path):
@@ -623,27 +635,9 @@ class GameWebSocketClient:
             return []
         return kept[-limit:]
 
-    def _build_recent_chat_context_for_llm(self) -> str:
-        """每 5 分钟最多追加一次最近 30 条聊天上下文。"""
-        now = time.time()
-        if now - float(self.state.llm_recent_chat_sent_at or 0.0) < 300:
-            return ""
-
-        recent_lines = self._get_recent_room_messages_for_llm(limit=30, exclude_sender="夏凌依")
-        if not recent_lines:
-            return ""
-
-        self.state.llm_recent_chat_sent_at = now
-        context_body = "\n".join(recent_lines)
-        return (
-            "以下是 room_say 最近30条聊天记录（已过滤发送者“夏凌依”），仅供你理解上下文：\n"
-            f"{context_body}\n"
-            "请基于这些上下文回答当前问题，回答仍需简短。"
-        )
-
     def _dispatch_room_say_to_llm(self, ws, obj: dict) -> None:
         """将 RoomSay 文本异步转发给大模型，并把结果按 SayInRoom 格式发送。"""
-        sender_name, msg_text = parse_room_say_payload(obj)
+        sender_name, msg_text,position = parse_room_say_payload(obj)
 
         allowlist = self.config.get_room_say_llm_allowlist()
         if sender_name not in allowlist:
@@ -671,7 +665,9 @@ class GameWebSocketClient:
         content = str(msg_text or "").strip()
         if not content:
             return
-
+        if content.isdigit():
+            print("llm_skip_pure_number")
+            return
         # 特殊指令处理：如果消息格式为 "<roomsite>[ ,]?添加权限[ ,]?<username>"，
         # 则在执行调用大模型前把 <username> 添加到 app_secrets.json 的 room_say_llm_allowlist。
         # 支持分隔符为空格或逗号或无分隔符。
@@ -704,37 +700,49 @@ class GameWebSocketClient:
                         current["room_say_llm_allowlist"] = allowlist
                         ok = save_app_secrets(current)
                         print(f"permission_cmd_by={sender_name} target={new_name} saved={ok}")
+                        self.send_room_message("添加权限成功~")
                     else:
                         print(f"permission_already_exists target={new_name}")
+                        self.send_room_message("添加权限已存在~")
                     # 不继续调用大模型
                     return
 
 
         # 为避免模型直接复述问题，构造更明确的提示：
         # 说明提问者并要求模型直接回答且不要复述问题。
-        recent_context = self._build_recent_chat_context_for_llm()
-        if sender_name:
-            base_input = (
-                f"玩家 {sender_name} 提问：{content}\n请作为友好的玩家直接回答这个问题，"
-                "不要复述问题，回答简短。"
-            )
+        # 智能判断是否需要长回复
+        long_response_keywords = ["故事", "小说", "长篇", "详细", "完整", "写一篇", "创作", "讲一个"]
+        is_long_request = any(keyword in content for keyword in long_response_keywords)
+        if is_long_request:
+            # 故事模式：只传递用户输入，不添加任何上下文
+            llm_input = content
+            print(f"llm_story_mode sender={sender_name} input={content[:30]}...")
         else:
-            base_input = f"请直接回答：{content}，不要复述问题。"
+            recent_context = self._get_full_llm_context()
+            # 构建包含位置信息的提示
+            position_info = f"（位置：{position}）" if position else ""
+            if sender_name:
+                base_input = (
+                    f"玩家 {sender_name},位置{position_info} 提问：{content}\n请作为友好的玩家直接回答这个问题，"
+                    "不要复述问题，回答简短。"
+                )
+            else:
+                base_input = f"请直接回答：{content}，不要复述问题。"
 
-        llm_input = f"{recent_context}\n\n{base_input}" if recent_context else base_input
+            if recent_context:
+                llm_input = f"{recent_context}\n\n{base_input}"
+            else:
+                llm_input = base_input
 
         def worker() -> None:
-            try:
-                reply_chunks = ask_llm_chunks(llm_input, chunk_size=50)
-                if not reply_chunks:
-                    print("llm_reply_empty=1")
-                    return
-
-                for idx, chunk in enumerate(reply_chunks, start=1):
-                    reply_text = str(chunk or "").strip()
+            from llm_client import ask_llm_stream
+            chunk_count = 0
+            if is_long_request:
+                for reply_text in ask_llm_stream(llm_input, chunk_size=50):
+                    reply_text = str(reply_text or "").strip()
                     if not reply_text:
                         continue
-
+                    chunk_count += 1
                     self._send_json(
                         ws,
                         {
@@ -743,19 +751,45 @@ class GameWebSocketClient:
                             "Msg": reply_text,
                             "c": "SayInRoom",
                         },
-                        f"llmSayInRoom#{idx}",
+                        f"llmSayInRoom#{chunk_count}",
                     )
-                print(f"llm_reply_chunks={len(reply_chunks)}")
-            except Exception as exc:
-                print(f"llm_call_error={exc}")
+                    # 在每个 chunk 发送后添加延时，防止刷屏被踢
+                    if chunk_count > 1:  # 第一条不延时，快速响应
+                        time.sleep(0.8)  # 每条消息间隔 0.8 秒
+            else:
+                try:
+                    reply_chunks = ask_llm_chunks(llm_input, chunk_size=50)
+                    if not reply_chunks:
+                        print("llm_reply_empty=1")
+                        return
+
+                    for idx, chunk in enumerate(reply_chunks, start=1):
+                        reply_text = str(chunk or "").strip()
+                        if not reply_text:
+                            continue
+
+                        self._send_json(
+                            ws,
+                            {
+                                "Act": "",
+                                "Color": "#FFFFFF",
+                                "Msg": reply_text,
+                                "c": "SayInRoom",
+                            },
+                            f"llmSayInRoom#{idx}",
+                        )
+                    print(f"llm_reply_chunks={len(reply_chunks)}")
+                except Exception as exc:
+                    print(f"llm_call_error={exc}")
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _handle_room_say(self, ws, obj: dict, _text: str) -> None:
         self.room_say_logger.log_room_say_message(obj, self.state.current_room_id)
-
+        # 更新用户位置映射
+        self._update_user_position_map(obj)
         # 先检查是否是天气查询
-        sender_name, msg_text = parse_room_say_payload(obj)
+        sender_name, msg_text,position = parse_room_say_payload(obj)
 
         # 检查消息是否以RoomSite开头
         site = str(self.state.current_room_site or "").strip()
@@ -1004,6 +1038,7 @@ class GameWebSocketClient:
         if cmd == "SO_Sync" and isinstance(obj, dict):
             try:
                 rows = obj.get("l") or obj.get("data") or []
+                has_position_change = False
                 for row in rows:
                     if not isinstance(row, (list, tuple)) or len(row) < 3:
                         continue
@@ -1012,10 +1047,24 @@ class GameWebSocketClient:
                         continue
                     name = str(payload.get("UserName") or "").strip()
                     site = payload.get("RoomSite")
-                    if name and site is not None and name == self.config.self_nickname:
-                        self.state.current_room_site = str(site)
-                        print(f"self_roomsite_update site={self.state.current_room_site} name={name}")
-                        break
+                    if name and site is not None:
+                        site_str = str(site)
+                        old_site = self.state.user_position_map.get(name)
+
+                        # 更新所有用户的位置映射
+                        self.state.user_position_map[name] = site_str
+                        # 如果位置发生变化，标记需要更新版本号
+                        if old_site != site_str:
+                            has_position_change = True
+                        # 如果是自己，也更新 current_room_site
+                        if name == self.config.self_nickname:
+                            self.state.current_room_site = str(site)
+                            print(f"self_roomsite_update site={self.state.current_room_site} name={name}")
+                            # 如果有位置变化，递增版本号
+                if has_position_change:
+                    self.state.position_map_version += 1
+                    print(f"-------------game_position_info_updated-----------------")
+
             except Exception as exc:
                 print(f"so_sync_parse_error={exc}")
 
@@ -1264,5 +1313,91 @@ class GameWebSocketClient:
                 )
         threading.Thread(target=worker, daemon=True).start()
 
+    def _update_user_position_map(self, obj: dict) -> None:
+        """从 RoomSay 消息中更新用户位置映射。"""
+        if not isinstance(obj, dict):
+            return
 
+        user_arr = obj.get("u")
+        if not isinstance(user_arr, list) or len(user_arr) < 3:
+            return
 
+        username = str(user_arr[2] or "").strip()
+        position = str(obj.get("s", "") or "").strip()
+
+        if username and position:
+            old_position = self.state.user_position_map.get(username)
+            # 只有当位置发生变化或是新用户时才更新版本号
+            if old_position != position:
+                self.state.user_position_map[username] = position
+                self.state.position_map_version += 1
+
+    def _build_position_info_string(self) -> str:
+        """构建用户位置信息的字符串表示。"""
+        if not self.state.user_position_map:
+            return ""
+
+        # 按位置排序，生成易读的格式
+        position_list = []
+        for username, position in sorted(self.state.user_position_map.items(),
+                                         key=lambda x: int(x[1]) if x[1].isdigit() else 999):
+            position_list.append(f"位置{position}: {username}")
+
+        return "，".join(position_list)
+
+    def _build_recent_chat_context_for_llm(self) -> str:
+        """每 1 分钟最多追加一次最近 20 条聊天上下文（仅处理聊天记录）。"""
+        now = time.time()
+        if now - float(self.state.llm_recent_chat_sent_at or 0.0) < 60:
+            return ""
+
+        recent_lines = self._get_recent_room_messages_for_llm(limit=20, exclude_sender="夏凌依")
+        if not recent_lines:
+            return ""
+
+        self.state.llm_recent_chat_sent_at = now
+        context_body = "\n".join(recent_lines)
+
+        result = (
+            "以下是 room_say 最近20条聊天记录（已过滤发送者’夏凌依‘，“夏凌依是你的名字”），仅供你理解上下文：\n"
+        f"{context_body}\n"
+        )
+
+        result += "请基于这些上下文回答当前问题，回答仍需简短。"
+        return result
+
+    def _build_position_context_for_llm(self) -> str:
+        """构建位置信息上下文（独立于聊天记录）。"""
+        # 检查位置映射表是否有更新
+        if self.state.position_map_version > self.state.llm_last_position_map_version:
+            position_info = self._build_position_info_string()
+            # 更新 LLM 上次使用的位置映射表版本号
+            self.state.llm_last_position_map_version = self.state.position_map_version
+
+            if position_info:
+                print(f"llm_position_info_updated version={self.state.position_map_version}")
+                return (
+                    f"\n【重要-最高优先级】当前房间内用户的最新位置信息（这是权威数据，必须以此为准）：\n"
+                    f"{position_info}\n"
+                    f"注意：如果聊天记录中的位置与此处冲突，请以本位置信息为准！\n"
+                )
+
+        return ""
+
+    def _get_full_llm_context(self) -> str:
+        """获取完整的 LLM 上下文（聊天记录 + 位置信息）。"""
+        chat_context = self._build_recent_chat_context_for_llm()
+        position_context = self._build_position_context_for_llm()
+
+        if not chat_context and not position_context:
+            return ""
+
+         # 组合两个上下文：位置信息放在最前面，强调其权威性
+        if position_context and chat_context:
+            # 位置信息在前，聊天记录在后，确保 LLM 优先参考最新位置
+            result = position_context + "\n" + chat_context
+            return result
+        elif position_context:
+            return position_context
+        else:
+            return chat_context
