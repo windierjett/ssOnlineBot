@@ -97,7 +97,39 @@ def get_secret_set(name: str, default: Set[str] | None = None) -> Set[str]:
 
     return fallback
 
+def get_llm_config(provider: str = "dashscope") -> Dict[str, str]:
+    """获取指定大模型提供商的完整配置。
+    Args:
+        provider: 大模型提供商名称，支持 "dashscope" 或 "deepseek"
+    Returns:
+        包含 api_key, base_url, model 的字典
+    """
+    secrets = load_app_secrets()
+    if provider == "dashscope":
+        return {
+            "api_key": secrets.get("dashscope_api_key", ""),
+            "base_url": secrets.get("dashscope_base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            "model": secrets.get("dashscope_model", "qwen-plus"),
+        }
+    elif provider == "deepseek":
+        return {
+            "api_key": secrets.get("deepseek_api_key", ""),
+            "base_url": secrets.get("deepseek_base_url", "https://api.deepseek.com/v1"),
+            "model": secrets.get("deepseek_model", "deepseek-v4-pro"),
+        }
+    else:
+        raise ValueError(f"不支持的大模型提供商: {provider}，支持的提供商: dashscope, deepseek")
 
+
+def get_current_llm_config() -> Dict[str, str]:
+    """获取当前使用的大模型配置。
+    默认使用 dashscope，可以在 app_secrets.json 中添加 "current_llm_provider" 字段来切换。
+    Returns:
+        包含 api_key, base_url, model 的字典
+    """
+    secrets = load_app_secrets()
+    provider = secrets.get("current_llm_provider", "dashscope")
+    return get_llm_config(provider)
 @dataclass
 class AppConfig:
     """应用配置对象。

@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><title>Agora Voice Bot</title></head>
+<body>
+<script src="https://download.agora.io/sdk/release/AgoraRTC_N-4.24.2.js"></script>
+<script>
+// ====== 由 Python 通过 Playwright 控制的 Agora 推流页面 ======
+
+let client = null;
+let bufferTrack = null;
+let status = 'idle';
+let statusMsg = '';
+let _audioFinished = false;  // 由 source-ended 事件设置
+
+// 输出状态给 Python 读取
+function reportState(s, msg) {
+    status = s;
+    statusMsg = msg || '';
+    document.title = JSON.stringify({status: s, msg: statusMsg});
+    document.getElementById('state').textContent = s;
+    document.getElementById('msg').textContent = statusMsg;
+}
+
+// 加入频道（不需要麦克风，仅建立连接）
+async function joinChannel(appId, channel, token, uid) {
+    try {
+        reportState('joining', `joining channel=${channel} uid=${uid}`);
+        if (client) { await client.leave(); client = null; }
+
+        client = AgoraRTC.createClient({ mode: 'rtc', codec: 'vp8' });
+
+        await client.join(appId, channel, token, uid);
+        reportState('joined', `joined channel=${channel} uid=${uid}`);
+        return { ok: true };
+    } catch (e) {
+        reportState('error', 'join failed: ' + e.message);
+        return { ok: false, error: e.message };
+    }
+}
+
+// 播放音频到频道（非阻塞：启动后立即返回，Python 侧轮询 isAudioFinished）
+async function playAudioFile(base64Data, mimeType, volume) {
+    try {
+        reportState('playing', 'decoding audio...');
+        const binaryStr = atob(base64Data);
+        const bytes = new Uint8Array(binaryStr.length);
+        for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const audioBuffer = await audioCtx.decodeAudioData(bytes.buffer);
+        reportState('playing', 'creating track...');
+        bufferTrack = await AgoraRTC.createBufferSourceAudioTrack({ source: audioBuffer });
+        if (bufferTrack.setVolume) bufferTrack.setVolume(Math.round(volume * 100));
+        _audioFinished = false;
+        bufferTrack.on('source-ended', () => {
+            _audioFinished = true;
+            reportState('done', 'audio finished');
+        });
+        await client.publish(bufferTrack);
+        bufferTrack.startProcessAudioBuffer();
+        const dur = audioBuffer.duration;
+        reportState('playing', `playing (${dur.toFixed(1)}s) vol=${volume}`);
+        return { ok: true, duration: dur };
+    } catch (e) {
+        reportState('error', 'play failed: ' + e.message);
+        return { ok: false, error: e.message };
+    }
+}
+
+// Python 轮询：音频是否播放完毕
+function isAudioFinished() {
+    return _audioFinished;
+}
+
+// 强制停止当前音频播放
+async function stopAudio() {
+    if (bufferTrack) {
+        try { bufferTrack.stopProcessAudioBuffer(); } catch(e) {}
+        try { client.unpublish(bufferTrack); } catch(e) {}
+        try { bufferTrack.close(); } catch(e) {}
+        bufferTrack = null;
+        _audioFinished = true;
+    }
+}
+
+// 离开频道
+async function leaveChannel() {
+    try {
+        if (bufferTrack) {
+            try { bufferTrack.stopProcessAudioBuffer(); } catch(e) {}
+            try { bufferTrack.close(); } catch(e) {}
+            bufferTrack = null;
+        }
+        if (client) { await client.leave(); client = null; }
+        reportState('idle', 'disconnected');
+        return { ok: true };
+    } catch (e) {
+        return { ok: false, error: e.message };
+    }
+}
+
+// 获取当前状态
+function getStatus() {
+    return JSON.stringify({ status: status, msg: statusMsg });
+}
+</script>
+<div id="state" style="font-size:24px;font-family:Arial;padding:20px;">idle</div>
+<div id="msg" style="font-size:14px;color:#666;"></div>
+</body>
+</html>

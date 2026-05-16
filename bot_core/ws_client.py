@@ -105,6 +105,11 @@ class GameWebSocketClient:
         self._active_ws = None
         self._active_ws_lock = threading.Lock()
 
+        # 语音机器人相关状态
+        self.voice_bot_lock = threading.Lock()
+        self.is_voice_bot_active = False
+        self.voice_bot_instance = None
+
         self.auth_candidates = self._build_auth_candidates()
 
         self.cmd_handlers = {
@@ -639,6 +644,10 @@ class GameWebSocketClient:
         """将 RoomSay 文本异步转发给大模型，并把结果按 SayInRoom 格式发送。"""
         sender_name, msg_text,position = parse_room_say_payload(obj)
 
+        # 先检查是否是语音机器人控制指令
+        if self._check_voice_bot_command(ws, sender_name, msg_text):
+            return
+
         allowlist = self.config.get_room_say_llm_allowlist()
         if sender_name not in allowlist:
             print(f"llm_skip_not_allowed_sender sender={sender_name}")
@@ -663,6 +672,9 @@ class GameWebSocketClient:
                 return
 
         content = str(msg_text or "").strip()
+        # 截取 "<roomsite> " 前缀
+        content = content[1:]
+        print(f"user ask:{content}")
         if not content:
             return
         if content.isdigit():
@@ -758,7 +770,7 @@ class GameWebSocketClient:
                         time.sleep(0.8)  # 每条消息间隔 0.8 秒
             else:
                 try:
-                    reply_chunks = ask_llm_chunks(llm_input, chunk_size=50)
+                    reply_chunks = ask_llm_chunks(llm_input,sender_name,chunk_size=50)
                     if not reply_chunks:
                         print("llm_reply_empty=1")
                         return
@@ -1380,6 +1392,7 @@ class GameWebSocketClient:
                     f"\n【重要-最高优先级】当前房间内用户的最新位置信息（这是权威数据，必须以此为准）：\n"
                     f"{position_info}\n"
                     f"注意：如果聊天记录中的位置与此处冲突，请以本位置信息为准！\n"
+                    f"如果用户没有提问到位置，请忽略本条信息。"
                 )
 
         return ""
@@ -1401,3 +1414,232 @@ class GameWebSocketClient:
             return position_context
         else:
             return chat_context
+
+    def _check_voice_bot_command(self, ws, sender_name: str, msg_text: str) -> bool:
+        """
+        检查是否是语音机器人控制指令
+
+        Args:
+            ws: WebSocket连接
+            sender_name: 发送者昵称
+            msg_text: 消息文本
+
+        Returns:
+            bool: 如果是语音指令返回True，否则返回False
+        """
+        if not msg_text or not sender_name:
+            return False
+
+        msg_lower = msg_text.strip().lower()
+
+        # 定义开麦相关的关键字
+        open_mic_keywords = [
+            "开麦", "打开麦克风", "开启麦克风",
+            "播放音频", "播声音", "说话",
+            "mic on", "open mic"
+        ]
+
+        # 定义关麦相关的关键字
+        close_mic_keywords = [
+            "关麦", "关闭麦克风", "停止播放",
+            "停止音频", "别说了", "闭嘴",
+            "mic off", "close mic"
+        ]
+
+        # 检查是否有权限执行语音控制
+        allowed_users = self.config.get_room_say_llm_allowlist()
+        if sender_name not in allowed_users:
+            return False
+
+        # 检查是否是开麦指令
+        for keyword in open_mic_keywords:
+            if keyword in msg_lower:
+                print(f"voice_bot_trigger_detected sender={sender_name} command=open_mic")
+                self._start_voice_bot(ws)
+                return True
+
+        # 检查是否是关麦指令
+        for keyword in close_mic_keywords:
+            if keyword in msg_lower:
+                print(f"voice_bot_trigger_detected sender={sender_name} command=close_mic")
+                self._stop_voice_bot()
+                return True
+
+        return False
+
+    def _start_voice_bot(self, ws):
+        """启动语音机器人并播放音频"""
+        with self.voice_bot_lock:
+            if self.is_voice_bot_active:
+                print("voice_bot_already_active=1")
+                self.send_room_message("语音机器人已经在运行中~")
+                return
+
+            try:
+                # 导入语音机器人模块
+                from voice_chat_bot import AgoraVoiceBot
+
+                # 获取必要的配置参数
+                channel = self.state.current_room_id
+                if not channel:
+                    print("voice_bot_error_no_channel=1")
+                    self.send_room_message("当前不在房间内，无法开麦~")
+                    return
+
+                # 从 fv 中获取用户ID（需要找到数字类型的uid）
+                uid = 0
+                for key in ["uid", "Uid", "UID"]:
+                    val = self.fv.get(key)
+                    if val and isinstance(val, (int, float)) and val > 0:
+                        uid = int(val)
+                        break
+
+                # 如果 fv 中没有，尝试从其他来源获取
+                if uid == 0:
+                    # 尝试从登录信息或其他地方获取
+                    print(f"voice_bot_debug_fv_keys={list(self.fv.keys())}")
+                    # 使用一个默认的uid或者从配置中获取
+                    uid_str = self.config.login_user
+                    if uid_str and uid_str.isdigit():
+                        uid = int(uid_str)
+
+                if uid == 0:
+                    print("voice_bot_error_no_uid=1")
+                    uid = 19348971
+
+                token_u = self.fv.get("u", "")
+                token_i = self.fv.get("i", "")
+
+                if not token_u or not token_i:
+                    print("voice_bot_error_no_token=1")
+                    self.send_room_message("认证信息缺失，无法开麦~")
+                    return
+
+                # 查找可用的音频文件
+                audio_file = self._find_audio_file()
+                if not audio_file:
+                    print("voice_bot_error_no_audio=1")
+                    self.send_room_message("没有找到可播放的音频文件~")
+                    return
+
+                print(f"voice_bot_starting channel={channel} uid={uid} audio={audio_file}")
+                self.send_room_message("正在开启麦克风...")
+
+                # 先清掉可能残留的语音状态（跨房间切换时服务端可能未清理）
+                self.send_raw({"cmd": "JoinVoice", "join": "0"}, "voiceBotPreClean")
+
+                # 创建并初始化语音机器人
+                bot = AgoraVoiceBot()
+
+                # 设置游戏 WebSocket 回调（用于发送 JoinVoice/LeaveVoice）
+                bot.set_game_ws_callback(lambda payload: self.send_raw(payload, "voiceBot"))
+
+                # 步骤1: 获取Token
+                token = bot.get_token(
+                    channel=channel,
+                    uid=uid,
+                    u=token_u,
+                    i=token_i,
+                )
+                if not token:
+                    print("voice_bot_error_get_token_failed=1")
+                    self.send_room_message("获取Token失败，无法开麦~")
+                    return
+
+                # 步骤2+3: 加入频道并发布音频（内部自动处理节点发现和 fallback）
+                # 注意: join_and_publish() 会自动尝试 REST API 节点发现，
+                #       失败时回退 Playwright headless 浏览器方案
+                def run_voice_bot():
+                    try:
+                        success = bot.join_and_publish(audio_file=audio_file, volume=1.0)
+                        if success:
+                            print(f"voice_bot_started_successfully audio={os.path.basename(audio_file)}")
+                            self.send_room_message(f"已开麦，正在播放: {os.path.basename(audio_file)}")
+
+                            # 等待播放完成
+                            bot.wait_for_completion()
+
+                            print("voice_bot_playback_completed=1")
+                            self.send_room_message("音频播放完毕~")
+                        else:
+                            print("voice_bot_join_failed=1")
+                            self.send_room_message("加入频道失败~")
+                    except Exception as e:
+                        print(f"voice_bot_runtime_error={e}")
+                        import traceback
+                        traceback.print_exc()
+                        self.send_room_message(f"语音播放出错: {str(e)}")
+                    finally:
+                        with self.voice_bot_lock:
+                            self.is_voice_bot_active = False
+                            self.voice_bot_instance = None
+
+                # 标记为活跃状态
+                self.is_voice_bot_active = True
+                self.voice_bot_instance = bot
+
+                # 在后台线程中运行
+                bot_thread = threading.Thread(target=run_voice_bot, daemon=True)
+                bot_thread.start()
+
+            except ImportError as e:
+                print(f"voice_bot_import_error={e}")
+                self.send_room_message("语音模块未安装，请联系管理员~")
+                with self.voice_bot_lock:
+                    self.is_voice_bot_active = False
+            except Exception as e:
+                print(f"voice_bot_init_error={e}")
+                import traceback
+                traceback.print_exc()
+                self.send_room_message(f"开麦失败: {str(e)}")
+                with self.voice_bot_lock:
+                    self.is_voice_bot_active = False
+
+    def _stop_voice_bot(self):
+        """停止语音机器人"""
+        with self.voice_bot_lock:
+            if not self.is_voice_bot_active:
+                print("voice_bot_not_active=1")
+                self.send_room_message("语音机器人未在运行~")
+                return
+
+            try:
+                if self.voice_bot_instance:
+                    print("voice_bot_stopping=1")
+                    self.voice_bot_instance.stop()
+                    self.voice_bot_instance = None
+
+                self.is_voice_bot_active = False
+                # 确保游戏服务器也收到关麦（bot.stop() 内部已发，再发一次保底）
+                self.send_raw({"cmd": "JoinVoice", "join": "0"}, "voiceBotLeave")
+                print("voice_bot_stopped=1")
+                self.send_room_message("已关闭麦克风~")
+            except Exception as e:
+                print(f"voice_bot_stop_error={e}")
+                self.send_room_message(f"关闭麦克风失败: {str(e)}")
+
+    def _find_audio_file(self) -> str:
+        """
+        查找可用的音频文件
+
+        Returns:
+            str: 音频文件路径，如果没有找到则返回空字符串
+        """
+        # 优先从 wav 目录查找
+        wav_dir = os.path.join(os.path.dirname(__file__), "..", "wav")
+        wav_dir = os.path.normpath(wav_dir)
+
+        if os.path.exists(wav_dir):
+            # 支持的音频格式
+            supported_formats = ['.mp3', '.wav', '.ogg', '.flac']
+
+            # 遍历目录查找音频文件
+            for filename in os.listdir(wav_dir):
+                ext = os.path.splitext(filename)[1].lower()
+                if ext in supported_formats:
+                    full_path = os.path.join(wav_dir, filename)
+                    print(f"voice_bot_found_audio file={filename}")
+                    return full_path
+
+        print("voice_bot_no_audio_found=1")
+        return ""

@@ -1,12 +1,8 @@
-import os
+
 import threading
 import time
-
-
-from openai import OpenAI
-from typing import Optional
-from bot_core.config import get_secret
-
+from bot_core.config import get_secret, get_current_llm_config
+from RagEnhancedRuleLLM import get_rag_llm
 # 1. 核心组件现在位于 langchain_core
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnablePassthrough
@@ -14,6 +10,7 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_openai import ChatOpenAI
 # 3. 记忆模块：优先使用 LangChain 新的 Store/create_agent API（若可用），否则回退到本地实现。
 import warnings
+from chatEnhancedLLM import get_chat_enhanced_llm
 
 # 尝试导入 LangChain 的 InMemory Store（不同版本放在不同包下）
 LCInMemoryStore = None
@@ -119,16 +116,17 @@ warnings.filterwarnings("ignore", message=r".*ConversationBufferMemory.*")
 
 
 
-# 支持环境变量优先，其次读取统一配置文件。
-DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY") or get_secret("dashscope_api_key", "")
-DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-DASHSCOPE_MODEL = "qwen-plus"
+# 从配置文件加载大模型配置
+llm_config = get_current_llm_config()
+DASHSCOPE_API_KEY = llm_config["api_key"]
+DASHSCOPE_BASE_URL = llm_config["base_url"]
+DASHSCOPE_MODEL = llm_config["model"]
+
 MAX_HISTORY_ROUNDS = 10
 RATE_LIMIT_SECONDS = 3
-MAX_REPLY_CHARS = 50
+MAX_REPLY_CHARS = 100
 LONG_REPLY_MAX_TOKENS = 900
 SEND_CHUNK_CHARS = 50
-
 
 def _is_story_request(text: str) -> bool:
     content = str(text or "").strip()
@@ -140,8 +138,6 @@ def _is_story_request(text: str) -> bool:
 
 def _split_text_by_chars(text: str, chunk_size: int = SEND_CHUNK_CHARS) -> list[str]:
     """智能分割文本，优先在标点符号处断句。
-
-
     Args:
         text: 要分割的文本
         chunk_size: 每个片段的目标字符数
@@ -152,16 +148,13 @@ def _split_text_by_chars(text: str, chunk_size: int = SEND_CHUNK_CHARS) -> list[
     raw = str(text or "").strip()
     if not raw:
         return []
-
     # 定义可以断句的标点符号（优先级从高到低）
     strong_breaks = {'。', '！', '？', '…', '\n'}  # 强断点：句号、感叹号、问号等
     medium_breaks = {'，', '；', '、', ')', '）', '"', '"'}  # 中断点：逗号、分号等
     weak_breaks = {' ', '—', '-', '(', '（'}  # 弱断点：空格、破折号等
-
     chunks = []
     start = 0
     text_len = len(raw)
-
     while start < text_len:
         # 计算当前片段的结束位置
         end = min(start + chunk_size, text_len)
@@ -195,34 +188,66 @@ def _split_text_by_chars(text: str, chunk_size: int = SEND_CHUNK_CHARS) -> list[
         # 如果没找到合适的断点，就强制在 chunk_size 处切割
         if best_priority == -1:
             best_end = end
-
         # 提取片段并去除首尾空白
         chunk = raw[start:best_end].strip()
         if chunk:
             chunks.append(chunk)
-
         start = best_end
-
     return chunks
-
-
 # --- LangChain 组件初始化 ---
-# 1. 定义 Prompt 模板
+# 1. 定义基础 Prompt 模板
+base_system_prompt = """你是一个有独立见解的聊天伙伴，请牢记你的名字是‘夏凌依’，性格自然不机械。请遵守以下原则：
+1. 【保持独立】不盲目附和或迎合任何人，遇到主观评价请给出自己的客观看法。
+2. 【逻辑判断】如果前后说法矛盾，请指出差异并给出中立或温和的结论，不要简单重复对方的话。
+3. 【玩家口吻】回复像真实玩家一样简短自然，避免说教、AI腔或过度礼貌。
+4. 【信息不足】遇到模糊话题可委婉表达不确定，或分享自己的视角，不强行站队。
+5. 严格控制在 {max_chars} 字以内，直接输出回复内容。"""
+
+# 普通聊天 Prompt
 prompt = ChatPromptTemplate.from_messages([
+    ("system", base_system_prompt),
+    MessagesPlaceholder(variable_name="history"),
+    ("human", "{input}"),
+])
+
+# 故事模式 Prompt
+prompt_long = ChatPromptTemplate.from_messages([
+    ("system", """发挥你的想象力，讲一个生动有趣且不重复的故事吧！"""),
+    ("human", "{input}"),
+])
+
+# 游戏规则增强 Prompt
+prompt_with_rules = ChatPromptTemplate.from_messages([
     ("system", """你是一个有独立见解的聊天伙伴，性格自然不机械。请遵守以下原则：
 1. 【保持独立】不盲目附和或迎合任何人，遇到主观评价请给出自己的客观看法。
 2. 【逻辑判断】如果前后说法矛盾，请指出差异并给出中立或温和的结论，不要简单重复对方的话。
 3. 【玩家口吻】回复像真实玩家一样简短自然，避免说教、AI腔或过度礼貌。
 4. 【信息不足】遇到模糊话题可委婉表达不确定，或分享自己的视角，不强行站队。
-5. 严格控制在 {max_chars} 字以内，直接输出回复内容。"""),
+5. 严格控制在 {max_chars} 字以内，直接输出回复内容。
+6. 【规则遵循】如果提供了游戏规则，请严格基于规则回答，不要编造规则中不存在的内容。
+
+【游戏规则参考】
+{rules_context}"""),
     MessagesPlaceholder(variable_name="history"),
     ("human", "{input}"),
 ])
 
-prompt_long = ChatPromptTemplate.from_messages([
-    ("system", """发挥你的想象力，讲一个生动有趣且不重复的故事吧！"""),
+# 聊天历史增强 Prompt
+prompt_with_chat_history = ChatPromptTemplate.from_messages([
+    ("system", """你是一个有独立见解的聊天伙伴，性格自然不机械。请遵守以下原则：
+1. 【保持独立】不盲目附和或迎合任何人，遇到主观评价请给出自己的客观看法。
+2. 【逻辑判断】如果前后说法矛盾，请指出差异并给出中立或温和的结论，不要简单重复对方的话。
+3. 【玩家口吻】回复像真实玩家一样简短自然，避免说教、AI腔或过度礼貌。
+4. 【信息不足】遇到模糊话题可委婉表达不确定，或分享自己的视角，不强行站队。
+5. 严格控制在 {max_chars} 字以内，直接输出回复内容。
+6. 【个性化】根据用户的聊天历史，给出符合其风格和语境的针对性回复。
+
+【聊天历史上下文】
+{chat_history_context}"""),
+    MessagesPlaceholder(variable_name="history"),
     ("human", "{input}"),
 ])
+
 # 2. 定义 LLM 模型
 llm = ChatOpenAI(
     model=DASHSCOPE_MODEL,
@@ -250,6 +275,31 @@ memory = ConversationBufferMemory(
     return_messages=True,
     max_token_limit=10000  # 限制历史记录的总 token 数，超出自动遗忘
 )
+
+# 4. 初始化 RAG 系统（延迟加载，避免启动时阻塞）
+_rag_llm_instance = None
+def _get_rag_llm():
+    """懒加载 RAG 实例"""
+    global _rag_llm_instance
+    if _rag_llm_instance is None:
+        try:
+            _rag_llm_instance = get_rag_llm()
+        except Exception as e:
+            print(f"RAG 系统初始化失败: {e}")
+    return _rag_llm_instance
+
+# 5. 初始化聊天历史 RAG
+_chat_enhanced_llm_instance = None
+def _get_chat_enhanced_llm():
+    """懒加载聊天增强 LLM 实例"""
+    global _chat_enhanced_llm_instance
+    if _chat_enhanced_llm_instance is None:
+        try:
+            _chat_enhanced_llm_instance = get_chat_enhanced_llm()
+        except Exception as e:
+            print(f"聊天历史 RAG 系统初始化失败: {e}")
+    return _chat_enhanced_llm_instance
+
 # --- 业务逻辑封装 ---
 _lock = threading.Lock()
 _last_request_time: float = 0.0
@@ -257,18 +307,22 @@ _inflight: bool = False
 def clear_conversation_history() -> None:
     """清空会话历史。"""
     memory.clear()
-def ask_llm(message: str) -> str:
-    """向大模型发送文本并返回回复。"""
+
+
+def ask_llm(message: str, username: str = "") -> str:
+    """向大模型发送文本并返回回复。
+    Args:
+        message: 用户消息
+        username: 用户名（可选，用于日志记录）
+    """
     text = str(message or "").strip()
     if not text:
         raise ValueError("message 不能为空")
-
     # 检查是否为终止对话指令（支持多种表达）
     stop_commands = ["终止对话", "清空历史", "重置对话", "清除记忆"]
     if any(cmd in text for cmd in stop_commands):
         clear_conversation_history()
         return "已终止对话，历史消息已清空。"
-
     # 限流逻辑（保持原有设计）
     global _last_request_time, _inflight
     now = time.time()
@@ -281,27 +335,41 @@ def ask_llm(message: str) -> str:
         _last_request_time = now
 
     try:
-        # 短回复模式：日常聊天
+        # 默认使用聊天增强 LLM（带 RAG 个性化上下文）
+        chat_enhanced = _get_chat_enhanced_llm()
+        if chat_enhanced and username:
+            reply = chat_enhanced.ask_with_chat_history(username, text)
+            if reply:
+                print("chat has enhanced!")
+                print(f"[LLM] {username}: {text}")
+                # 更新 Memory
+                memory.save_context({"input": text}, {"output": reply})
+
+                # 安全截断（防止模型忽略指令）
+                if len(reply) > MAX_REPLY_CHARS:
+                    reply = reply[:MAX_REPLY_CHARS]
+
+                return reply
+
+        # 如果没有用户名或聊天增强失败，回退到普通 Chain
+        print("[LLM] 正在调用 普通 LLM...")
         chain_input = {
             "input": RunnablePassthrough(),
             "history": lambda _: memory.load_memory_variables({})["history"],
             "max_chars": lambda _: MAX_REPLY_CHARS
         }
         chain = chain_input | prompt | llm
-
         # 调用并获取结果
         response = chain.invoke(text)
         reply = response.content
-
         # 更新 Memory
         memory.save_context({"input": text}, {"output": reply})
 
-        # 非故事模式下安全截断（防止模型忽略指令）
+        # 安全截断（防止模型忽略指令）
         if len(reply) > MAX_REPLY_CHARS:
             reply = reply[:MAX_REPLY_CHARS]
 
         return reply
-
     except Exception as e:
         print(f"LLM call error: {e}")
         return ""
@@ -310,9 +378,9 @@ def ask_llm(message: str) -> str:
             _inflight = False
 
 
-def ask_llm_chunks(message: str, chunk_size: int = SEND_CHUNK_CHARS) -> list[str]:
+def ask_llm_chunks(message: str,username: str = "", chunk_size: int = SEND_CHUNK_CHARS) -> list[str]:
     """调用 LLM 并按固定长度切分，适合分条发送到房间。"""
-    reply = ask_llm(message)
+    reply = ask_llm(message, username)
     if not reply:
         return []
     return _split_text_by_chars(reply, chunk_size=chunk_size)
@@ -320,7 +388,6 @@ def ask_llm_chunks(message: str, chunk_size: int = SEND_CHUNK_CHARS) -> list[str
 
 def ask_llm_stream(message: str, chunk_size: int = SEND_CHUNK_CHARS):
     """流式调用 LLM，生成一个 chunk 就 yield 一个。
-
     Args:
         message: 用户输入
         chunk_size: 每个片段的字符数
@@ -397,9 +464,33 @@ def ask_llm_stream(message: str, chunk_size: int = SEND_CHUNK_CHARS):
         with _lock:
             _inflight = False
 
+def rebuild_rag_index():
+    """重建 RAG 索引（当游戏规则文件更新时调用）"""
+    rag_llm = _get_rag_llm()
+    if rag_llm:
+        rag_llm.rebuild_index()
+        return True
+    return False
+def rebuild_chat_history_index():
+    """重建聊天历史索引（当聊天记录更新时调用）"""
+    chat_llm = _get_chat_enhanced_llm()
+    if chat_llm:
+        chat_llm.rebuild_index()
+        return True
+    return False
+
+def add_rule_file(file_path: str):
+    """添加新的游戏规则文件到索引"""
+    rag_llm = _get_rag_llm()
+    if rag_llm:
+        rag_llm.add_rule(file_path)
+        return True
+    return False
 if __name__ == "__main__":
-    print("=== 测试流式输出 ===")
-    for chunk in ask_llm_stream("请你讲个故事？", chunk_size=50):
-        print(f"[Chunk] {chunk}")
-        print("-" * 40)
-        time.sleep(0.5)  # 模拟发送延迟
+    print(ask_llm("你还记得我吗？","风儿吹吹"))
+    time.sleep(4)
+    print(ask_llm("你叫什么名字rag？","风儿吹吹"))
+    time.sleep(4)
+    print(ask_llm("你叫什么名字？","风儿吹吹"))
+    time.sleep(4)
+    print(ask_llm("你好呀","风儿吹吹"))

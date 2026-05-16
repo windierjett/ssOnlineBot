@@ -9,3 +9,9 @@ edge-tts
 faiss-cpu
 langchain-community
 chromadb
+langchain-text-splitters
+aiortc>=1.6.0
+av>=10.0.0
+pyaudio>=0.2.11
+numpy>=1.21.0
+playwright>=1.40.0
